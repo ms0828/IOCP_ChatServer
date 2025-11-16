@@ -1,0 +1,838 @@
+#include "pch.h"
+#include "LanServer.h"
+
+CLanServer::CLanServer()
+{
+	hCp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	listenSock = INVALID_SOCKET;
+	sessionArr = nullptr;
+	sessionIdCnt = 1;
+	numOfMaxSession = 0;
+
+	iocpWorkerHandleArr = nullptr;
+	acceptThreadHandle = nullptr;
+	monitoringThreadHandle = nullptr;
+	numOfWorkerThread = 0;
+
+	shutdownEvent = CreateEvent(nullptr, true, false, nullptr);
+
+	acceptTPS = 0;
+	recvMessageTPS = 0;
+	sendMessageTPS = 0;
+}
+
+CLanServer::~CLanServer()
+{
+	delete[] iocpWorkerHandleArr;
+	delete[] sessionArr;
+}
+
+bool CLanServer::Start(PCWSTR servIp, USHORT servPort, ULONG numOfWorker, ULONG maxSessionNum)
+{
+	//----------------------------------------------------------
+	// Session 배열 메모리 할당
+	//----------------------------------------------------------
+	numOfMaxSession = maxSessionNum;
+	numOfWorkerThread = numOfWorker;
+	sessionArr = new Session[numOfMaxSession]();
+	for (int i = numOfMaxSession - 1; i >= 0; i--)
+	{
+		indexStack.Push((USHORT&)i);
+	}
+
+
+	//----------------------------------------------------------
+	// Completion Port 생성 및 워커 스레드 생성
+	//----------------------------------------------------------
+	iocpWorkerHandleArr = new HANDLE[numOfWorkerThread];
+	for (int i = 0; i < numOfWorkerThread; i++)
+		iocpWorkerHandleArr[i] = (HANDLE)_beginthreadex(nullptr, 0, IOCPWorkerProc, this, 0, nullptr);
+
+	//-------------------
+	// 모니터링 스레드
+	//-------------------
+	monitoringThreadHandle = (HANDLE)_beginthreadex(nullptr, 0, MonitoringThreadProc, this, 0, nullptr);
+
+	//----------------------------------------------------------
+	// 소켓 라이브러리 초기화
+	//----------------------------------------------------------
+	WSAData wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"WSAStartUp Fail");
+		return false;
+	}
+
+
+	//----------------------------------------------------------
+	// 리슨 소켓 생성
+	//----------------------------------------------------------
+	listenSock = socket(AF_INET, SOCK_STREAM, 0);
+	if (listenSock == INVALID_SOCKET)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"listenSock Create Fail");
+		return false;
+	}
+
+	//----------------------------------------------------------
+	// LINGER 옵션 활성화
+	// - closesocket 시 RST 송신
+	//----------------------------------------------------------
+	LINGER linger;
+	linger.l_onoff = 1;
+	linger.l_linger = 0;
+	if (setsockopt(listenSock, SOL_SOCKET, SO_LINGER, (char*)&linger, sizeof(linger)) != 0)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"[Start] setsockopt Fail -  LINGER Option Fail / errorCode = %d", WSAGetLastError());
+		return false;
+	}
+
+	//----------------------------------------------------------
+	// I/O Pending 유도하기 위해 TCP 송신 버퍼 크기를 0으로 세팅
+	//----------------------------------------------------------
+	int optval = 0;
+	if (setsockopt(listenSock, SOL_SOCKET, SO_SNDBUF, (char*)&optval, sizeof(optval)) != 0)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"[Connect] setsockopt Fail - Send Buf Size Setting / errorCode = %d", WSAGetLastError());
+		return false;
+	}
+
+
+	//----------------------------------------------------------
+	// listenSocket 주소 바인딩
+	//----------------------------------------------------------
+	SOCKADDR_IN servAdr;
+	memset(&servAdr, 0, sizeof(servAdr));
+	servAdr.sin_family = AF_INET;
+	InetPton(AF_INET, servIp, &servAdr.sin_addr);
+	servAdr.sin_port = htons(servPort);
+	int bindRet = bind(listenSock, (SOCKADDR*)&servAdr, sizeof(servAdr));
+	if (bindRet == SOCKET_ERROR)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"Bind Fail / ErrorCode = %d", WSAGetLastError());
+		return false;
+	}
+
+	//----------------------------------------------------------
+	// listen
+	//----------------------------------------------------------
+	int listenRet = listen(listenSock, SOMAXCONN);
+	if (listenRet == SOCKET_ERROR)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"listen Fail");
+		return false;
+	}
+
+	//----------------------------------------------------------
+	// AccpetThread 생성 및 가동
+	//----------------------------------------------------------
+	acceptThreadHandle = (HANDLE)_beginthreadex(nullptr, 0, AcceptProc, this, 0, nullptr);
+
+	_LOG(dfLOG_LEVEL_SYSTEM, L"Server Start");
+
+	return true;
+}
+
+void CLanServer::Stop()
+{
+	closesocket(listenSock);
+	WaitForSingleObject(acceptThreadHandle, INFINITE);
+
+	for (int i = 0; i < numOfMaxSession; i++)
+	{
+		bool bConnect = !(sessionArr[i].refCount & (1 << 31));
+		if (bConnect)
+			DisconnectSession(sessionArr[i].sessionId);
+	}
+
+	SetEvent(shutdownEvent);
+	
+	for (int i = 0; i < numOfWorkerThread; i++)
+		PostQueuedCompletionStatus(hCp, 0, (ULONG_PTR)nullptr, nullptr);
+
+	for (int i = 0; i < numOfWorkerThread; i++)
+		CloseHandle(iocpWorkerHandleArr[i]);
+	CloseHandle(acceptThreadHandle);
+	CloseHandle(monitoringThreadHandle);
+}
+
+unsigned int CLanServer::IOCPWorkerProc(void* arg)
+{
+	CLanServer* core = static_cast<CLanServer*>(arg);
+
+	while (1)
+	{
+		//--------------------- GQCS 예외 처리---------------------------
+		// 1. GQCS가 false을 반환
+		//		(1) CP 핸들이 닫힌 경우 (또는 타임 아웃) -> Dequeue 실패 -> overlapped == null
+		//		(2) 연결이 파괴된 경우(RST) overlapped != null, transferred = 0
+		//			-> 그러나 I/O가 실패했다고 즉시 처리할 게 없다.
+		//				- 멀티 스레드 환경에서는 I/O 실패를 인지 후에 I/O 성공 완료 통지가 처리될 수 있음
+		//				- 그 자리에서 세션을 삭제한다거나.. 등의 처리가 불가
+		// 2. GQCS가 true를 반환
+		//		- I/O 성공 및 Dequeue 성공
+		//--------------------------------------------------------------
+		DWORD transferred = 0;
+		ULONGLONG sessionId;
+		SessionOlp* sessionOlp;
+		bool gqcsRet = GetQueuedCompletionStatus(core->hCp, &transferred, (PULONG_PTR)&sessionId, (LPOVERLAPPED*)&sessionOlp, INFINITE);
+
+
+		PRO_BEGIN("CompletionRoutine");
+		//--------------------------------------------------------------
+		// lpOverlapped가 null인지 확인 필요 
+		//  - CP 핸들이 닫힌 경우 (또는 dwMillisecond 타임 아웃) -> Dequeue 실패
+		//  - 이 때 completion Key와 transferred는 과거 값 그대로 남아있기 때문에, 엉뚱한 세션에 잘못된 로직이 돌 가능성이 있으므로 무조건 체크
+		//	
+		// Dequeue 실패에 대한 예외 처리를 따로 분류해서 하지 않음을 선택
+		//	- PQCS 종료 신호에 따른 워커 스레드 종료 처리에 대한 예외
+		//	- overlapped null, transferred 0, completion key 0
+		//	- 이에 대한 예외가 상단에 들어갔다면 결국 overlapped null이면 워커 스레드 종료를 타게 됨
+		//	- PQCS 종료 신호에 대한 예외처리로 overlapped가 null임을 일괄 처리 (나머지 멤버도 0으로 초기화를 하니까)
+		//--------------------------------------------------------------
+		if (sessionOlp == nullptr)
+		{
+			_LOG(dfLOG_LEVEL_SYSTEM, L"Completion Status - Overlapped is null!\n");
+			return 0;
+		}
+
+
+		// ------------------------------------------
+		// 세션 검색
+		// ------------------------------------------
+		Session* session = core->FindSessionById(sessionId);
+		if (session == nullptr)
+			continue;
+
+
+		// ------------------------------------------
+		// [ transferred가 0이 되는 상황 ]
+		// - RST로 인한 I/O 실패
+		// - FIN으로 인한 I/O 성공
+		// 
+		// [ transferred가 0일 때 어떻게 처리할 것인가? ]
+		// - 즉시 세션 연결 끊는 것은 불가하며, RefCount 감소 후 연결 끊기를 시도한다.
+		// ------------------------------------------
+		if (transferred == 0)
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / Completion port - Transferred = 0 / Decrement RefCount = %d\n", session->sessionId, refCount);
+			if (refCount == 0)
+				core->ReleaseSession(session);
+			continue;
+		}
+
+
+		//---------------------------------------------------------
+		// Recv 완료 처리
+		//---------------------------------------------------------
+		if (sessionOlp->type == ERecv)
+		{
+			RecvOlp* sendOlp = (RecvOlp*)&sessionOlp;
+			session->recvQ->MoveWritePos(transferred);
+			_LOG(dfLOG_LEVEL_DEBUG, L"------------Session Id : %016llx / CompletionPort : Recv  / transferred : %d------------\n", session->sessionId, transferred);
+			while (1)
+			{
+				//-------------------------------------------
+				// 완성된 메시지 추출
+				//-------------------------------------------
+				st_PacketHeader header;
+				int peekRet = session->recvQ->PeekData((char*)&header, sizeof(header));
+				if (peekRet < sizeof(header))
+					break;
+				if (session->recvQ->GetDataSize() < sizeof(header) + header.payloadLen)
+					break;
+				session->recvQ->MoveReadPos(sizeof(st_PacketHeader));
+				CPacketView* message = CPacketView::AllocPacketView(session->recvQ, header.payloadLen);
+				core->OnMessage(session->sessionId, 0, message); // 에코 더미 전용 ( 원래 0이 아닌 packetheader를 넣어야함 )
+				CPacketView::ReleasePacketView(message);
+				session->recvQ->MoveReadPos(header.payloadLen);
+				InterlockedIncrement(&core->recvMessageTPS);
+			}
+
+			// ------------------------------------------
+			// 다시 Recv 걸기
+			// ------------------------------------------
+			ULONG refCount = InterlockedIncrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / Completion port - BeforeRecvPost / InCrement RefCount = %d\n", session->sessionId, refCount);
+			core->RecvPost(session);
+		}
+		else if (sessionOlp->type == ESend)
+		{
+			SendOlp* sendOlp = (SendOlp*)&sessionOlp;
+			//---------------------------------------------------------
+			// Send 완료 처리
+			//  - 사용한 직렬화 버퍼 반납
+			//  - 송신 중임을 나타내는 플래그 비활성화
+			//  - Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send 
+			//---------------------------------------------------------
+			_LOG(dfLOG_LEVEL_DEBUG, L"------------Session Id : %016llx / CompletionPort : Send  / transferred : %d------------\n", session->sessionId, transferred);
+			for (int i = 0; i < session->sendOlp.sendCount; i++)
+				CPacket::ReleaseSendPacket(session->sendOlp.freePackets[i]);
+			session->sendOlp.sendCount = 0;
+
+			InterlockedExchange(&session->isSending, false);
+
+			if (session->sendLFQ->size > 0)
+				core->SendPost(session, false);
+
+		}
+
+
+		// ----------------------------------------------------------------
+		// IOCount 감소 후, 세션 정리 시점 확인
+		// ----------------------------------------------------------------
+		ULONG refCount = InterlockedDecrement(&session->refCount);
+
+		if (sessionOlp->type == ESend)
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / Completion port - AfterRoutine [Send] / Decrement RefCount = %d\n", session->sessionId, refCount);
+		else
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / Completion port - AfterRoutine [Recv] / Decrement RefCount = %d\n", session->sessionId, refCount);
+
+
+		if (refCount == 0)
+			core->ReleaseSession(session);
+
+		PRO_END("CompletionRoutine");
+	}
+	return 0;
+}
+
+void CLanServer::RecvPost(Session* session)
+{
+	PRO_BEGIN("RecvPost");
+
+	//------------------------------------------------------------------
+	// RecvPost가 취소 되는 상황
+	// 1. 해당 세션의 Disconnect 플래그가 활성화된 경우
+	// 2. 해당 세션의 RecvQ가 꽉 찬 경우
+	//		- 이 경우는 해당 세션의 Disconnect 플래그 활성화하여 세션 종료 유도
+	//-------------------------------------------------------------------
+	if (session->isDisconnect)
+	{
+		ULONG refCount = InterlockedDecrement(&session->refCount);
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / RecvPost Cancle - bDisconnect / Decrement RefCount = %d \n", session->sessionId, refCount);
+		if (refCount == 0)
+			ReleaseSession(session);
+		return;
+	}
+
+	_LOG(dfLOG_LEVEL_DEBUG, L"------------AsyncRecv  session id : %016llx------------\n", session->sessionId);
+
+	//------------------------------------------------------------------
+	// 1. 새로운 recvQ(CPacket)를 CPacket 풀에서 할당 및 이전에 사용했던 recvQ(CPacket) 반납
+	//  - 이전 recvQ(CPacket)에 미완성된 데이터가 있다면 현재 할당한 recvQ(CPacket)로 옮기기
+	// 2. 해당 session에 할당 받은 recvQ(CPacket) 포인터 등록
+	//-------------------------------------------------------------------
+	CPacket* newRecvQ = CPacket::AllocRecvPacket();
+	if (session->recvQ != nullptr)
+	{
+		if (session->recvQ->GetDataSize() > 0)
+			int putRet = newRecvQ->PutData(session->recvQ->GetReadPtr(), session->recvQ->GetDataSize());
+		CPacket::ReleaseRecvPacket(session->recvQ);
+	}
+	session->recvQ = newRecvQ;
+
+
+	//------------------------------------------------------------------
+	// WSARecv 호출
+	//-------------------------------------------------------------------
+	//_LOG(dfLOG_LEVEL_ERROR, L"Increment RefCount - RecvPost\n");
+	memset(&session->recvOlp, 0, sizeof(WSAOVERLAPPED));
+	WSABUF wsaRecvBuf;
+	wsaRecvBuf.buf = newRecvQ->GetBufferPtr();
+	wsaRecvBuf.len = newRecvQ->GetBufferSize() - newRecvQ->GetDataSize();
+	if (wsaRecvBuf.len == 0)
+	{
+		// recvQ가 가득찬 상황은 설계된 메시지 크기를 초과한 메시지가 온 것
+		// - 연결 종료로 대처
+		InterlockedExchange(&session->isDisconnect, true);
+		ULONG refCount = InterlockedDecrement(&session->refCount);
+		_LOG(dfLOG_LEVEL_SYSTEM, L"session id : %016llx / recvQ is Full / Decrement RefCount = %d \n", session->sessionId, refCount);
+		if (refCount == 0)
+			ReleaseSession(session);
+		return;
+	}
+	DWORD flags = 0;
+	int recvRet = WSARecv(session->sock, &wsaRecvBuf, 1, nullptr, &flags, (WSAOVERLAPPED*)&session->recvOlp, nullptr);
+	if (recvRet == 0)
+	{
+		_LOG(dfLOG_LEVEL_DEBUG, L" RECV (FAST I/O) \n");
+	}
+	else if (recvRet == SOCKET_ERROR)
+	{
+		int error = WSAGetLastError();
+		if (error == WSA_IO_PENDING)
+		{
+			_LOG(dfLOG_LEVEL_DEBUG, L"RECV IO PENDING\n");
+		}
+		else
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / RecvError / errorCode = %d / Decrement RefCount = %d)! \n", session->sessionId, error, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+	}
+
+	PRO_END("RecvPost");
+	return;
+}
+
+void CLanServer::SendPost(Session* session, bool bCallFromSendPacket)
+{
+	PRO_BEGIN("SendPost");
+	//--------------------------------------------------------
+	// SendPost가 취소 되는 상황
+	// 1. 현재 Send가 진행 중
+	// 2. 해당 세션의 Disconnect 플래그가 활성화된 경우
+	// 3. 해당 세션의 SendQ가 비어있는 경우
+	//--------------------------------------------------------
+	if (InterlockedCompareExchange(&session->isSending, true, false) == true || session->isDisconnect)
+	{
+		if (bCallFromSendPacket)
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendPost Cancle / Decrement RefCount = %d)! \n", session->sessionId, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+		return;
+	}
+
+
+	_LOG(dfLOG_LEVEL_DEBUG, L"------------AsyncSend  session id : %016llx------------\n", session->sessionId);
+
+
+	//--------------------------------------------------------
+	// SendQ에 대한 WSABUF 세팅
+	// - SendQ에 담긴 패킷 수가 0이라면 SendPost 취소
+	// - SendQ에 담긴 패킷 수가 최대 보낼 수 있는 패킷 수 보다 많다면 비정상적인 상황이므로 해당 연결 끊기
+	//--------------------------------------------------------
+	WSABUF wsaBufArr[dfMaxSendPacketCount];
+	int sendQSize = session->sendLFQ->size;
+	if (sendQSize == 0)
+	{
+		_LOG(dfLOG_LEVEL_DEBUG, L"id : %016llx  / LFQ size = 0\n", session->sessionId);
+		InterlockedExchange(&session->isSending, false);
+
+		//------------------------------------------------------------------------------------------
+		// [ 예외 처리 ]
+		// size를 0으로 봤으나, 이 시점에 소유권으로 인해 다른 SendPacket에서 SendPost가 실패한다면 마지막 Enqueue된 패킷은 전송되지 못한다.
+		// => size가 0인 시점에 소유권 포기 이후, 한 번더 size를 체크하여 재시도를 수행한다.
+		//------------------------------------------------------------------------------------------
+		if (session->sendLFQ->size > 0)
+			SendPost(session, false);
+
+		if (bCallFromSendPacket)
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendPost(Call From SendPacket) LFQ size = 0 / Decrement RefCount = %d)! \n", session->sessionId, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+		return;
+	}
+	if (sendQSize > dfMaxSendPacketCount)
+	{
+		_LOG(dfLOG_LEVEL_SYSTEM, L"packetCount overflow / id : %016llx------------\n", session->sessionId);
+		InterlockedExchange(&session->isDisconnect, true);
+
+		if (bCallFromSendPacket)
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendPost PacketCountOverflow / Decrement RefCount = %d)! \n", session->sessionId, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+		return;
+	}
+
+	//----------------------------------------------------------------
+	// 현 락프리큐 구현은 ABA로 인한 일시적 큐 끊김이 발생할 가능성이 존재
+	// - 락프리큐 size와 실제 Dequeue가능한 size가 일치하지 않을 가능성이 있다.
+	// - 이에 대해서 별도의 Dequeue가 성공한 개수(sendPacketCount)를 계산한다.
+	//----------------------------------------------------------------
+	int sendPacketCount = 0;
+	for (int i = 0; i < sendQSize; i++)
+	{
+		CPacket* packet;
+		bool ret = session->sendLFQ->Dequeue(packet);
+		if (ret == false)
+		{
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / LFQ Dequeue Fail! (ABA => size != dequeueCount)\n", session->sessionId);
+			break;
+		}
+		wsaBufArr[i].buf = packet->GetBufferPtr();
+		wsaBufArr[i].len = packet->GetDataSize();
+
+		// Session에서 CPacketPool로의 반환을 위한 포인터 관리
+		session->sendOlp.freePackets[i] = packet;
+		++sendPacketCount;
+	}
+
+	if (sendPacketCount != sendQSize) // 테스트용 (이 현상이 자주 있는지 확인하기 위해) (나중에 지우기)
+		__debugbreak();
+
+	session->sendOlp.sendCount = sendPacketCount;
+	//------------------------------------------------------------------------------------------
+	// - 만약에 위 문제로 인해서 sendPacketCount가 0이라면 SendPost는 취소한다.
+	// 
+	// [ 예외 처리 ]
+	// - 이 시점에 소유권으로 인해 다른 SendPacket에서 SendPost가 실패한다면 마지막 Enqueue된 패킷은 전송되지 못한다.
+	// - 소유권 포기 이후, 한 번더 size를 체크하여 재시도를 수행한다.
+	//------------------------------------------------------------------------------------------
+	if (sendPacketCount == 0)
+	{
+		_LOG(dfLOG_LEVEL_DEBUG, L"id : %016llx  / SendPacketCount = 0)! \n", session->sessionId);
+		InterlockedExchange(&session->isSending, false);
+		if (session->sendLFQ->size > 0)
+			SendPost(session, false);
+
+		if (bCallFromSendPacket)
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendPost PacketCountOverflow / Decrement RefCount = %d)! \n", session->sessionId, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+		return;
+	}
+
+
+
+	//--------------------------------------------------------
+	// WSASend 호출
+	//--------------------------------------------------------
+	if (!bCallFromSendPacket)
+	{
+		ULONG refCount = InterlockedIncrement(&session->refCount);
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendPost / Increment RefCount = %d)! \n", session->sessionId, refCount);
+	}
+
+	memset(&session->sendOlp, 0, sizeof(WSAOVERLAPPED));
+	DWORD sendBytes;
+	int sendRet = WSASend(session->sock, wsaBufArr, sendPacketCount, &sendBytes, 0, (WSAOVERLAPPED*)&session->sendOlp, nullptr);
+	if (sendRet == 0)
+	{
+		_LOG(dfLOG_LEVEL_DEBUG, L"Send (FAST I/O) / sendBytes : %d \n", sendBytes);
+	}
+	else if (sendRet == SOCKET_ERROR)
+	{
+		int error = WSAGetLastError();
+		if (error == WSA_IO_PENDING)
+		{
+			_LOG(dfLOG_LEVEL_DEBUG, L" Send IO PENDING\n");
+		}
+		else
+		{
+			ULONG refCount = InterlockedDecrement(&session->refCount);
+			_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / SendError / errorCode = %d / Decrement RefCount = %d)! \n", session->sessionId, error, refCount);
+			if (refCount == 0)
+				ReleaseSession(session);
+		}
+	}
+	PRO_END("SendPost");
+	return;
+}
+
+void CLanServer::SendPacket_Unicast(ULONGLONG sessionId, CPacket* packet)
+{
+	PRO_BEGIN("SendPacket_Unicast");
+	InterlockedIncrement(&sendMessageTPS);
+	InterlockedIncrement(&packet->refCount);
+	Session* session = AcquireSessionById(sessionId);
+	if (session == nullptr)
+	{
+		InterlockedDecrement(&packet->refCount);
+		return;
+	}
+	session->sendLFQ->Enqueue(packet);
+	SendPost(session, true);
+
+	PRO_END("SendPacket_Unicast");
+	return;
+}
+
+void CLanServer::SendPacket_Broadcast(ULONGLONG* sessionIdArr, ULONG numOfSession, CPacket* packet)
+{
+	PRO_BEGIN("SendPacket_Broadcast");
+	InterlockedAdd((LONG*)&sendMessageTPS, numOfSession);
+	InterlockedAdd((LONG*)&packet->refCount, numOfSession);
+	for (int i = 0; i < numOfSession; i++)
+	{
+		Session* session = AcquireSessionById(sessionIdArr[i]);
+		if (session == nullptr)
+		{
+			InterlockedDecrement(&packet->refCount);
+			continue;
+		}
+		session->sendLFQ->Enqueue(packet);
+		SendPost(session, true);
+	}
+
+	PRO_END("SendPacket_Broadcast");
+	return;
+}
+
+bool CLanServer::DisconnectSession(ULONGLONG sessionId)
+{
+	//------------------------------------------------------------
+	// 세션 검색 및 세션 확보(Ref Count 증가)
+	// - Disconnect flag를 활성화 하기 위해 세션 참조권 확보 필요
+	//		- 엉뚱한 세션에 Disconnect flag 활성화 방지
+	//------------------------------------------------------------
+	Session* session = AcquireSessionById(sessionId);
+	if (session == nullptr)
+		return false;
+
+	//-------------------------------------------------------
+	// 해당 세션의 Disconnect flag 활성화
+	//-------------------------------------------------------
+	InterlockedExchange(&session->isDisconnect, 1);
+
+
+	//--------------------------------------------------------
+	// - 상대방이 recv IO PENDING이 걸려있다면, disconnect flag를 올려두어도 완료통지가 오지 않아 refCount가 1로 남아있게 된다.
+	// - 어떻게 이를 끊을 것인가?
+	// - shutdown을 써서 미완료 통지의 IO를 중단시키는 방법을 생각해봤으나, graceful shutdown을 진입하는 것이 마음에 들지 않는다.
+	// - shutdown 대신 CancelIoEx를 이용하여 IO 요청을 중단시키는 방법을 선택
+	//--------------------------------------------------------
+	CancelIoEx((HANDLE)session->sock, nullptr);
+
+
+	//-------------------------------------------------------
+	// 확보한 세션의 Ref Count 복구
+	//-------------------------------------------------------
+	ULONG refCount = InterlockedDecrement(&session->refCount);
+	_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / DisconnectSession / Decrement RefCount = %d)! \n", session->sessionId, refCount);
+	if (refCount == 0)
+		ReleaseSession(session);
+
+
+	return true;
+}
+
+void CLanServer::ReleaseSession(Session* session)
+{
+	//------------------------------------------------------------------------
+	// RefCount의 최상위 비트를 Release를 나타내는 Flag를 두어, Release 진행 시 세션 접근을 막는다.
+	// - RefCount가 0이라면 ReleaseFlag 활성화 후 Release 수행
+	// - RefCount가 0이 아니라면 Release는 취소
+	//------------------------------------------------------------------------
+	ULONG releaseFlag = (1 << 31);
+	if (InterlockedCompareExchange(&session->refCount, releaseFlag, 0) != 0)
+		return;
+
+	if (session->bRecvRST == false)
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / ReleaseSession With Not RST\n", session->sessionId);
+	else
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / ReleaseSession\n", session->sessionId);
+
+
+	//-----------------------------------------------------------------------
+	// 해당 세션에서 반납하지 못한 CPacket 반환
+	// - Dequeue되어 전송하지 못한 SendLFQ에 존재하는 CPacket
+	// - 반납되지 못한 Session의 freePacket에 존재하는 CPacket
+	// - WSARecv 호출에 실패하여 반납되지 못한 session->recvQ에 저장된 CPacket
+	//-----------------------------------------------------------------------
+	while (1)
+	{
+		CPacket* packet = nullptr;
+		if (session->sendLFQ->Dequeue(packet) == false)
+			break;
+		CPacket::ReleaseSendPacket(packet);
+	};
+	for (int i = 0; i < session->sendOlp.sendCount; i++)
+		CPacket::ReleaseSendPacket(session->sendOlp.freePackets[i]);
+
+	if (session->recvQ != nullptr)
+		CPacket::ReleaseRecvPacket(session->recvQ);
+
+
+	//------------------------------------------------------------------------
+	// 해당 세션 메모리 초기화 및 배열 인덱스 반환
+	//------------------------------------------------------------------------
+	closesocket(session->sock);
+	session->sock = INVALID_SOCKET;
+	OnClientLeave(session->sessionId);
+	USHORT arrIndex = GetSessionArrIndex(session->sessionId);
+	indexStack.Push(arrIndex);
+	
+	return;
+}
+
+USHORT CLanServer::GetSessionArrIndex(ULONGLONG sessionId)
+{
+	USHORT sessionArrIndex = (sessionId >> 48);
+	return sessionArrIndex;
+}
+
+Session* CLanServer::AcquireSessionById(ULONGLONG sessionId)
+{
+	//----------------------------------------------
+	// 해당 세션 Id로 부터 배열 인덱스 획득 및 세션 검색
+	//----------------------------------------------
+	USHORT arrIndex = GetSessionArrIndex(sessionId);
+	if (arrIndex < 0 || arrIndex > numOfMaxSession - 1)
+		return nullptr;
+	Session* session = &sessionArr[arrIndex];
+
+	//-----------------------------------------------
+	// 세션 참조 카운트 증가 후 찾은 세션이 유효한지 검사
+	// - Release에 진입한 세션인지 (RefCount의 최상위 비트를 ReleaseFlag로 활용)
+	// - 해당 세션이 이미 삭제되어 같은 메모리에 다른 세션이 들어와있는 경우인지
+	// 
+	// [ 유의 사항 ]
+	// RefCount 증가 및 Release 진입 여부 확인 이후에 세션이 바뀌었는지 검사가 필요
+	// - 위 시점 이후부터 세션이 바뀌지 않음을 보장받을 수 있기 때문
+	//-----------------------------------------------
+	ULONG refCount = InterlockedIncrement(&session->refCount);
+	_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / arrIndex = %d / parameter id : %016llx / AcquireSessionById / Increment RefCount = %d)! \n", session->sessionId, arrIndex, sessionId, refCount);
+
+	ULONG releaseFlag = session->refCount & (1 << 31);
+	if (releaseFlag)
+	{
+		ULONG refCount = InterlockedDecrement(&session->refCount);
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / arrIndex = %d / parameter id : %016llx / AcquireSessionById - Already Release Enter Session\n", session->sessionId, arrIndex, sessionId);
+		if (refCount == 0)
+			ReleaseSession(session);
+		return nullptr;
+	}
+
+	//-----------------------------------------------
+	// 이 시점부터 session은 도중에 바뀌지 않음
+	// - 세션 변경 검사의 유효성이 보장된다.
+	//-----------------------------------------------
+	if (session->sessionId != sessionId)
+	{
+		ULONG refCount = InterlockedDecrement(&session->refCount);
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx  / arrIndex = %d / parameter id : %016llx / AcquireSessionById - Target Session Changed / Decrement RefCount = %d \n", session->sessionId, arrIndex, sessionId, refCount);
+		if (refCount == 0)
+			ReleaseSession(session);
+		return nullptr;
+	}
+
+	return session;
+}
+
+Session* CLanServer::FindSessionById(ULONGLONG sessionId)
+{
+	//----------------------------------------------
+	// 해당 세션 Id로 부터 배열 인덱스 획득 및 세션 검색
+	//----------------------------------------------
+	USHORT arrIndex = GetSessionArrIndex(sessionId);
+	if (arrIndex < 0 || arrIndex > numOfMaxSession - 1)
+		return nullptr;
+	Session* session = &sessionArr[arrIndex];
+
+
+	//-----------------------------------------------
+	// 찾은 세션이 유효한지 검사
+	// - 해당 세션이 이미 삭제되어 같은 메모리에 다른 세션이 들어와있는 경우인지
+	//-----------------------------------------------
+	if (session->sessionId != sessionId)
+	{
+		_LOG(dfLOG_LEVEL_ERROR, L"FindSessionById - session id is not correct. array session id : %016llx / find session id : %016llx  \n", session->sessionId, sessionId);
+		return nullptr;
+	}
+
+	return session;
+}
+
+unsigned int CLanServer::AcceptProc(void* arg)
+{
+	CLanServer* core = static_cast<CLanServer*>(arg);
+
+	while (1)
+	{
+		SOCKADDR_IN clnAdr;
+		int clnAdrSz = sizeof(clnAdr);
+		SOCKET clnSock = accept(core->listenSock, (SOCKADDR*)&clnAdr, &clnAdrSz);
+		if (clnSock == INVALID_SOCKET)
+		{
+			_LOG(dfLOG_LEVEL_ERROR, L"accpet Fail - ListenSocket이 닫혔는지 확인하세요.");
+			break;
+		}
+
+		//----------------------------------------------------------
+		// 연결을 허용할지 확인
+		//----------------------------------------------------------
+		bool isPossibleConnection = core->OnConnectionRequest(&clnAdr);
+		if (isPossibleConnection == false)
+		{
+			closesocket(clnSock);
+			_LOG(dfLOG_LEVEL_DEBUG, L"OnConnectionRequest - 거부된 연결 요청입니다.");
+			continue;
+		}
+
+
+		//------------------------------------------------------
+		// 사용 가능한 세션 배열 인덱스 추출
+		//------------------------------------------------------
+		ULONGLONG arrIndex = 0;
+		bool ret = core->indexStack.Pop((USHORT&)arrIndex);
+		if (ret == false)
+		{
+			_LOG(dfLOG_LEVEL_ERROR, L"error : indexStack Pop Fail  -- stackSize = %d\n", core->indexStack.GetSize());
+			closesocket(clnSock);
+			continue;
+		}
+
+
+		//------------------------------------------------------
+		// 세션 Id 생성 ( 세션 배열 인덱스(2byte) + sessionIdCnt(6byte) )
+		//------------------------------------------------------
+		ULONGLONG sessionId = ((arrIndex << 48) | (core->sessionIdCnt & core->sessionIdMask));
+		++core->sessionIdCnt;
+
+
+		//------------------------------------------------------
+		// 세션 배열에 새로운 세션 할당 및 초기화
+		//------------------------------------------------------
+		Session& newSession = core->sessionArr[arrIndex];
+		newSession.InitSession(clnSock, sessionId);
+		CreateIoCompletionPort((HANDLE)newSession.sock, core->hCp, (ULONG_PTR)newSession.sessionId, 0);
+		_LOG(dfLOG_LEVEL_ERROR, L"id : %016llx / Login And Init / arrIndex = %d\n", sessionId, arrIndex);
+
+
+		//------------------------------------------------------
+		// 해당 세션의 OnAccept 호출 및 Recv 등록
+		//------------------------------------------------------
+		core->OnClientJoin(newSession.sessionId);
+		core->RecvPost(&newSession);
+		core->acceptTPS++;
+	}
+	return 0;
+}
+
+unsigned int CLanServer::MonitoringThreadProc(void* arg)
+{
+	CLanServer* core = static_cast<CLanServer*>(arg);
+
+	while (1)
+	{
+		DWORD ret = WaitForSingleObject(core->shutdownEvent, 1000);
+		if (ret == WAIT_OBJECT_0)
+		{
+			_LOG(dfLOG_LEVEL_SYSTEM, L"shutdown event is signal - MonitoringThread Exit!");
+			break;
+		}
+
+		// ------------------------------------------------------------------------
+		// Todo
+		// - 로그인(인증) 전, 일정 시간 동안 인증 요청을 보내지 않으면 연결 끊기
+		// - 로그인(인증) 후, 일정 시간동안 하트비트 메시지를 보내지 않으면 연결 끊기 
+		// ------------------------------------------------------------------------
+		for (int i = 0; i < core->numOfMaxSession; i++)
+		{
+				
+		}
+
+		core->OnMonitoring();
+	}
+
+	return 0;
+}
+
+
